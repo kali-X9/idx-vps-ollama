@@ -1,91 +1,134 @@
-#!/usr/bin/env bash
-# vps.sh - remote VPS helper utilities (deploy, backup, snapshot, status, remote ollama install)
-set -euo pipefail
-IFS=$'\n\t'
+#!/bin/bash
+# Menu-driven VPS Manager for idx-vps-ollama
+# Author: kali-X9
+# Updated: $(date +%Y-%m-%d)
 
-print_status() {
-    local t=$1; shift
-    case "$t" in
-        INFO)  echo -e "\033[1;34m[INFO]\033[0m $*";;
-        WARN)  echo -e "\033[1;33m[WARN]\033[0m $*";;
-        ERROR) echo -e "\033[1;31m[ERROR]\033[0m $*" >&2;;
-        SUCCESS) echo -e "\033[1;32m[SUCCESS]\033[0m $*";;
-        *) echo "[$t] $*";;
+set -eo pipefail
+
+# Constants
+VPS_REQUIRED_RAM=48  # in GB
+VPS_REQUIRED_SSD=120 # in GB
+
+# COLORS for better visuals
+GREEN='\033[1;32m'
+CYAN='\033[1;36m'
+RED='\033[1;31m'
+NC='\033[0m' # No Color
+
+# Ensure the script runs as root
+if [ "$EUID" -ne 0 ]; then
+  echo -e "${RED}[ERROR] Please run this script as root.${NC}"
+  exit 1
+fi
+
+# Menu header/logo
+function banner() {
+  clear
+  echo -e "${CYAN}"
+  echo "###################################################"
+  echo "#               idx-vps-ollama                    #"
+  echo "#      Autonomous VPS Setup and Management        #"
+  echo "###################################################"
+  echo -e "${NC}"
+}
+
+# Verify System Config Requirements (48GB RAM, 120GB Disk)
+function verify_system_requirements() {
+  echo -e "${GREEN}[INFO] Verifying system requirements...${NC}"
+  
+  AVAILABLE_RAM=$(free -g | awk '/^Mem:/{print $2}')
+  AVAILABLE_DISK=$(df --output=avail -BG / | tail -n 1 | grep -o '[0-9]*')
+
+  if (( AVAILABLE_RAM < VPS_REQUIRED_RAM )); then
+    echo -e "${RED}[ERROR] Minimum RAM required: ${VPS_REQUIRED_RAM} GB. Available: ${AVAILABLE_RAM} GB.${NC}"
+    exit 1
+  fi
+
+  if (( AVAILABLE_DISK < VPS_REQUIRED_SSD )); then
+    echo -e "${RED}[ERROR] Minimum SSD required: ${VPS_REQUIRED_SSD} GB. Available: ${AVAILABLE_DISK} GB.${NC}"
+    exit 1
+  fi
+
+  echo -e "${GREEN}[SUCCESS] System requirements satisfied.${NC}"
+}
+
+# Install Dependencies
+function install_dependencies() {
+  echo -e "${GREEN}[INFO] Installing dependencies...${NC}"
+
+  apt-get update
+  apt-get install -y qemu-kvm libvirt-daemon-system libvirt-clients curl jq shellcheck shfmt
+
+  echo -e "${GREEN}[SUCCESS] All dependencies installed.${NC}"
+}
+
+# Create a New VM
+function create_vm() {
+  echo -e "${CYAN}Enter the following details for your VM:${NC}"
+  echo -n "VM Name: "
+  read VM_NAME
+
+  echo -n "Cloud Image Path (e.g., ubuntu-cloud.img): "
+  read VM_IMAGE
+
+  echo -e "${GREEN}[INFO] Creating VM '${VM_NAME}' using image '${VM_IMAGE}'...${NC}"
+  ./vm.sh create --name "$VM_NAME" --image "$VM_IMAGE" --cpus 4 --memory 8192
+  echo -e "${GREEN}[SUCCESS] VM '${VM_NAME}' created.${NC}"
+}
+
+# Deploy to VPS
+function deploy_ollama() {
+  echo -e "${CYAN}Enter VPS details for deployment:${NC}"
+  echo -n "SSH User (e.g., ubuntu): "
+  read SSH_USER
+  echo -n "VPS IP Address: "
+  read VPS_IP
+  echo -e "${GREEN}[INFO] Deploying Ollama to VPS at '${SSH_USER}@${VPS_IP}'...${NC}"
+  
+  # Transfer and install Ollama remotely
+  ./vps.sh deploy --host "${SSH_USER}@${VPS_IP}" --key ~/.ssh/id_rsa --script tools/ollama-install.sh
+  echo -e "${GREEN}[SUCCESS] Ollama deployed successfully.${NC}"
+}
+
+# Real-time Monitoring
+function monitor_vps() {
+  echo -e "${CYAN}Enter VPS details to monitor:${NC}"
+  echo -n "SSH User (e.g., ubuntu): "
+  read SSH_USER
+  echo -n "VPS IP Address: "
+  read VPS_IP
+  echo -e "${GREEN}[INFO] Fetching real-time stats...${NC}"
+
+  ssh "${SSH_USER}@${VPS_IP}" 'top -b -n 1 | head -n 20'
+  echo -e "${GREEN}[INFO] Real-time stats displayed.${NC}"
+}
+
+# Main Menu
+function main_menu() {
+  while true; do
+    banner
+    echo -e "${CYAN}Main Menu${NC}"
+    echo "1. Verify System Requirements"
+    echo "2. Install Dependencies"
+    echo "3. Create New VM"
+    echo "4. Deploy Ollama on VPS"
+    echo "5. Monitor VPS in Real-Time"
+    echo "6. Exit"
+    echo -n "Enter your choice: "
+    read CHOICE
+    
+    case $CHOICE in
+      1) verify_system_requirements ;;
+      2) install_dependencies ;;
+      3) create_vm ;;
+      4) deploy_ollama ;;
+      5) monitor_vps ;;
+      6) echo -e "${GREEN}Exiting... Goodbye!${NC}"; exit 0 ;;
+      *) echo -e "${RED}[ERROR] Invalid choice. Try again.${NC}" ;;
     esac
+    read -n 1 -s -r -p "Press any key to return to the menu..."
+  done
 }
 
-usage() {
-    cat <<EOF
-vps.sh - VPS helper
-
-Usage:
-  vps.sh deploy <user@host> <local-dir> <remote-dir>
-  vps.sh backup <user@host> <remote-dir> [dest-dir]
-  vps.sh snapshot <qcow2-file> <snapshot-name>
-  vps.sh status <user@host>
-  vps.sh ollama-install <user@host> <BINARY_URL> <SHA256>
-EOF
-}
-
-cmd_deploy() {
-    local target="$1"; local local_dir="$2"; local remote_dir="$3"
-    print_status INFO "Deploy $local_dir -> $target:$remote_dir"
-    rsync -avz --delete --exclude '.git' --exclude 'node_modules' "$local_dir"/ "$target":"$remote_dir"/
-    print_status SUCCESS "Rsync complete"
-}
-
-cmd_backup() {
-    local target="$1"; local remote_dir="$2"; local out_dir="${3:-./backups}"
-    mkdir -p "$out_dir"
-    local host=$(echo "$target" | cut -d'@' -f2)
-    local stamp; stamp=$(date -u +"%Y%m%dT%H%M%SZ")
-    print_status INFO "Backing up $target:$remote_dir -> $out_dir"
-    ssh "$target" "set -euo pipefail; mkdir -p /tmp/vps-backup; tar -czf /tmp/vps-backup/${host//./-}-${stamp}.tgz -C '$remote_dir' .; cat /tmp/vps-backup/${host//./-}-${stamp}.tgz" > "${out_dir}/${host//./-}-${stamp}.tgz"
-    print_status SUCCESS "Backup saved to ${out_dir}/${host//./-}-${stamp}.tgz"
-}
-
-cmd_snapshot() {
-    local qcow2="$1"; local snap="$2"
-    if [[ ! -f "$qcow2" ]]; then print_status ERROR "qcow2 $qcow2 not found"; return 1; fi
-    qemu-img snapshot -c "$snap" "$qcow2"
-    print_status SUCCESS "Created snapshot $snap on $qcow2"
-}
-
-cmd_status() {
-    local target="$1"
-    print_status INFO "Checking SSH to $target..."
-    if ssh -o BatchMode=yes -o ConnectTimeout=5 "$target" true 2>/dev/null; then
-        print_status SUCCESS "SSH OK"
-        print_status INFO "Remote disk usage:"
-        ssh "$target" "df -hT --total | sed -n '1,10p'"
-    else
-        print_status ERROR "SSH connection to $target failed"
-        return 1
-    fi
-}
-
-cmd_ollama_install() {
-    # usage: vps.sh ollama-install user@host <BINARY_URL> <SHA256>
-    local target="$1"; local url="$2"; local sha="$3"
-    local local_installer="tools/ollama-install.sh"
-    if [[ ! -f "$local_installer" ]]; then print_status ERROR "$local_installer not found in repo"; return 1; fi
-    print_status INFO "Copying installer to $target:/tmp/ollama-install.sh"
-    scp "$local_installer" "$target":/tmp/ollama-install.sh
-    print_status INFO "Running installer on $target (requires sudo on remote)"
-    ssh "$target" "sudo bash /tmp/ollama-install.sh '$url' '$sha'"
-}
-
-main() {
-    if [ $# -lt 1 ]; then usage; exit 1; fi
-    local cmd="$1"; shift
-    case "$cmd" in
-        deploy)  [ $# -eq 3 ] || { usage; exit 1; }; cmd_deploy "$@";;
-        backup)  [ $# -ge 2 ] || { usage; exit 1; }; cmd_backup "$@";;
-        snapshot)[ $# -eq 2 ] || { usage; exit 1; }; cmd_snapshot "$@";;
-        status)  [ $# -eq 1 ] || { usage; exit 1; }; cmd_status "$@";;
-        ollama-install) [ $# -eq 3 ] || { usage; exit 1; }; cmd_ollama_install "$@";;
-        *) usage; exit 1 ;;
-    esac
-}
-
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then main "$@"; fi
+# Start Menu System
+main_menu
