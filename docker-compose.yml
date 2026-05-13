@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    environment:
+      # Add env if you require an API key, etc.
+      # OLLAMA_API_KEY: ""
+    volumes:
+      - ollama-data:/var/lib/ollama
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:11434/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  ollama-data:
